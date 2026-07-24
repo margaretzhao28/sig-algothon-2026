@@ -18,7 +18,7 @@ MAX_HOLDING_DAYS = 30
 DOLLAR_LIMIT = 10_000
 EPS = 1e-12
 
-# Selected from the first-500-day correlation/cointegration research screen.
+# Selected from the days-0–300 correlation/cointegration research screen.
 # Each tuple is (instrument index A, instrument index B, ticker A, ticker B).
 PAIRS = (
     (10, 46, "SMAH", "ILVX"),
