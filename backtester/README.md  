@@ -1,0 +1,452 @@
+# Algothon 25 — Backtesting Framework
+
+A research-grade backtesting framework for the Algothon trading competition. Evaluates any `getMyPosition()` strategy against the 50-instrument simulated universe with accounting identical to the official `eval.py`, then extends it with configurable windows, walk-forward cross-validation, bootstrap confidence intervals, parameter sweeps, and a full suite of risk and trade diagnostics.
+
+---
+
+## Project structure
+
+```
+algothon-25/
+├── backtest/
+│   ├── __init__.py        Public API
+│   ├── data.py            Price loading, train/test splits, CV generators
+│   ├── engine.py          Core simulation loop (eval.py parity + configurable)
+│   ├── metrics.py         All metrics: score, Sharpe, drawdown, VaR, turnover, etc.
+│   ├── robustness.py      Walk-forward, bootstrap CI, parameter sweep
+│   └── report.py          Text report printer + matplotlib PDF plots
+├── run_backtest.py        CLI entry point
+├── main.py                Strategy file — implement getMyPosition() here
+├── eval.py                Official eval.py (unmodified, for reference)
+├── test_parity.py         Parity test: confirms engine matches eval.py to float precision
+└── prices.txt             50 instruments × 1250 days of price data
+```
+
+---
+
+## Setup
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install numpy pandas scipy matplotlib
+```
+
+---
+
+## Implementing a strategy
+
+Edit `main.py`. The only requirement is a `getMyPosition()` function:
+
+```python
+import numpy as np
+
+def getMyPosition(prices: np.ndarray) -> np.ndarray:
+    """
+    Parameters
+    ----------
+    prices : np.ndarray, shape (nInst, nt)
+        Full price history up to and including today.
+        nInst = 50 instruments, nt grows by 1 each call.
+
+    Returns
+    -------
+    np.ndarray, shape (nInst,)
+        Integer share positions. Positive = long, negative = short.
+        eval clips to ±int($10,000 / current_price) per instrument.
+    """
+    nInst, nt = prices.shape
+    return np.zeros(nInst, dtype=int)   # replace with your signal
+```
+
+**Rules enforced by eval:**
+- Commission: 10 bps on gross dollar volume traded each day
+- Position limit: `±int($10,000 / price)` shares per instrument — positions are clipped automatically
+- Called once per day with the full price history up to that day
+- Position changes from the prior call are traded at the most recent price
+
+---
+
+## Running a backtest
+
+### CLI
+
+```bash
+# Activate venv first
+source .venv/bin/activate
+
+# Default: research on the first RESEARCH_FRAC (50%) of days; score the unseen rest
+python run_backtest.py
+
+# Widen/narrow the research period — eval window is still "the rest"
+python run_backtest.py --research-frac 0.4
+
+# Explicit sub-window: score [500, 750), deliberately leaving [750, nt) untouched
+# (the framework doesn't enforce that seal — it's on you)
+python run_backtest.py --eval-start 500 --eval-end 750
+
+# Truncate to first 1000 days, then score an explicit window within them
+python run_backtest.py --max-days 1000 --eval-start 500 --eval-end 1000
+
+# Match the official eval.py window exactly (days 751–1000)
+python run_backtest.py --eval-start 751 --eval-end 1001
+
+# Save all plots to a PDF
+python run_backtest.py --plots report.pdf
+
+# Walk-forward cross-validation (rolling out-of-sample windows)
+python run_backtest.py --walk-forward --test-size 125
+
+# Bootstrap confidence interval on score
+python run_backtest.py --bootstrap --n-bootstrap 2000
+
+# Full run — walk-forward + bootstrap + plots + all stats, auto-saved to results/<dataset>/<timestamp>/
+python run_backtest.py --full
+```
+
+Full CLI options:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--prices` | `prices.txt` | Path to price data file |
+| `--strategy` | `main` | Module name containing `getMyPosition` |
+| `--max-days` | none | Truncate price history to first N days before any window resolution (protects trailing data from ever being seen) |
+| `--research-frac` | `0.5` | Fraction of days reserved for research/design `[0, research_frac * nt)`; default eval window is the unseen rest |
+| `--eval-start` | auto | Explicit first day `t` to score (overrides `--research-frac`; for eval.py parity or a deliberate sub-window) |
+| `--eval-end` | auto | Explicit exclusive upper bound (overrides `--research-frac`) |
+| `--comm-rate` | `0.001` | Commission rate (10 bps) |
+| `--pos-limit` | `10000` | Dollar position limit per instrument |
+| `--walk-forward` | off | Rolling out-of-sample CV across multiple windows |
+| `--train-size` | `500` | Walk-forward window placement (does **not** restrict history — see Methodology) |
+| `--test-size` | `125` | Walk-forward test window (days) |
+| `--step` | `=test-size` | Walk-forward step size |
+| `--bootstrap` | off | Compute bootstrap CI on score |
+| `--n-bootstrap` | `2000` | Bootstrap iterations |
+| `--boot-method` | `stationary` | Bootstrap method: `stationary` (preserves PL autocorrelation) or `iid` |
+| `--out-dir` | none | Directory to save stats (JSON/CSV); auto-named under `results/` when `--full` |
+| `--plots` | off | Save plots to this path (`.pdf` or `.png`) |
+| `-v` | off | Print per-day output |
+| `--full` | off | Walk-forward + bootstrap + plots + all stats → `results/<dataset>/<timestamp>/` |
+
+### Programmatic API
+
+```python
+from backtest import (
+    load_prices, run_backtest, compute_metrics,
+    print_report, save_plots,
+    walk_forward, bootstrap_score_ci, parameter_sweep,
+)
+from backtest.report import print_walk_forward_summary
+from main import getMyPosition
+
+prices = load_prices("prices.txt")    # shape: (50, 1250)
+
+# --- Single evaluation pass ---
+# Default scores the unseen rest after the research period (research_frac=0.5 ->
+# eval [nt/2, nt)). Pass eval_start/eval_end for an explicit sub-window — e.g. to
+# test on part of the unseen data while leaving the remainder untouched, or to
+# reproduce the eval.py window exactly.
+result  = run_backtest(prices, getMyPosition)                          # the unseen rest
+result  = run_backtest(prices, getMyPosition, eval_start=500, eval_end=750)   # explicit sub-window
+result  = run_backtest(prices, getMyPosition, eval_start=751, eval_end=1001)  # eval.py parity
+metrics = compute_metrics(result)
+print_report(result, metrics)
+save_plots(result, metrics, "report.pdf")
+
+# --- Walk-forward CV ---
+folds = walk_forward(prices, getMyPosition, train_size=500, test_size=125)
+print_walk_forward_summary(folds)
+
+# --- Bootstrap CI (stationary block bootstrap — preserves PL autocorrelation) ---
+ci = bootstrap_score_ci(result, n_bootstrap=2000, method="stationary")
+print(f"Score: {ci['score']:.4f}  95% CI: [{ci['ci_lower']:.4f}, {ci['ci_upper']:.4f}]")
+print(f"P(score > 0): {ci['prob_positive']:.1%}")
+
+# --- Parameter sweep (with built-in in-sample / out-of-sample split) ---
+def make_strategy(lookback, z_scale):
+    def getMyPosition(prices):
+        ...  # use lookback, z_scale
+    return getMyPosition
+
+sweep = parameter_sweep(
+    prices, make_strategy,
+    param_grid={"lookback": [10, 20, 40], "z_scale": [100, 200, 500]},
+)
+# sweep is a dict: trust OOS, not IS (see Methodology & bias section)
+print("trials:", sweep["n_trials"], " IS-OOS corr:", round(sweep["is_oos_corr"], 3))
+print("naive pick (best IS):", sweep["best_is"]["params"],
+      "IS=%.3f OOS=%.3f" % (sweep["best_is"]["is_score"], sweep["best_is"]["oos_score"]))
+print("honest winner (best OOS):", sweep["best_oos"]["params"])
+
+# --- Access any metric directly ---
+print(metrics["score"], metrics["ann_sharpe"], metrics["t_stat"], metrics["p_value"])
+print(metrics["max_drawdown"], metrics["sortino"], metrics["autocorr_lag1"])
+```
+
+---
+
+## Metrics reference
+
+### Competition score
+| Key | Description |
+|---|---|
+| `score` | `mean(PL) - 0.1 * std(PL)` — the competition objective |
+| `mean_pl` | Mean daily PL ($) |
+| `std_pl` | Std dev of daily PL (population, ddof=0 — matches eval.py score) |
+| `std_pl_sample` | Sample std (ddof=1 — used for inferential stats) |
+| `ann_sharpe` | Annualised Sharpe: `sqrt(250) * mean / std` |
+| `t_stat` | t-statistic for H0: mean daily PL = 0 |
+| `p_value` | Two-sided p-value (i.i.d. assumption — **optimistic**, see Methodology) |
+| `pl_per_dollar_traded` | eval.py's "ret": cumulative PL ÷ dollar volume. **Not** a return on capital |
+| `total_dvolume` | Total gross dollar volume traded |
+| `total_commission` | Total commission paid ($) |
+| `commission_pct_of_dvolume` | Total commission as a fraction of gross dollar volume |
+| `n_eval_days` | Number of days in the eval window |
+| `best_day_pl` / `worst_day_pl` | Single best / worst daily PL ($) |
+
+### Risk-adjusted returns
+| Key | Description |
+|---|---|
+| `sortino` | Annualised Sortino ratio (target downside deviation, MAR=0, full-N denominator) |
+| `calmar_ratio` | Annualised dollar PL / max drawdown |
+| `omega_ratio` | Gross gains / gross losses (>1 = net positive) |
+| `var_95` / `cvar_95` | Historical VaR / CVaR at 95% confidence |
+| `var_99` / `cvar_99` | Historical VaR / CVaR at 99% confidence |
+| `downside_dev` | Target downside deviation (RMS of `min(PL, 0)` over all days) |
+
+### Drawdown analysis
+| Key | Description |
+|---|---|
+| `max_drawdown` | Peak-to-trough drawdown on cumulative portfolio value ($) |
+| `max_pl_drawdown` | Peak-to-trough drawdown on the cumulative PL series ($ — equals `max_drawdown` here; kept for clarity) |
+| `max_drawdown_pct_capital` | Max drawdown as a fraction of average gross exposure (capital deployed) |
+| `capital_base` | Average gross dollar exposure (the % denominator) |
+| `max_drawdown_duration_days` | Longest single drawdown period (days) |
+| `avg_drawdown_duration_days` | Mean length of drawdown periods |
+| `pct_time_underwater` | Fraction of eval days below equity peak |
+| `ulcer_index` | RMS of percentage drawdown (penalises depth and duration) |
+| `pain_ratio` | Sharpe scaled by Ulcer index |
+
+### Distribution & tail risk
+| Key | Description |
+|---|---|
+| `skewness` | PL distribution skewness (negative = left-tail heavy) |
+| `kurtosis_excess` | Excess kurtosis vs. normal (>0 = fat tails) |
+| `tail_ratio` | P95 / \|P5\| (>1 = right-skewed tails) |
+| `avg_win` / `avg_loss` | Average winning / losing day PL |
+| `profit_factor` | Gross wins / gross losses (>1 = profitable) |
+| `win_loss_ratio` | avg_win / \|avg_loss\| |
+| `max_consec_loss_days` | Longest losing streak |
+| `max_consec_win_days` | Longest winning streak |
+
+### PL dynamics
+| Key | Description |
+|---|---|
+| `autocorr_lag1` | Lag-1 autocorrelation of daily PL (+= trending, –= mean-reverting) |
+| `rolling_sharpe_20d` | Array: rolling 20-day annualised Sharpe (for plots) |
+
+### Trade diagnostics
+| Key | Description |
+|---|---|
+| `hit_rate` | Fraction of eval days with positive PL |
+| `trade_frequency` | Fraction of (day, instrument) pairs with a non-zero position change |
+| `n_instruments_traded` | Number of instruments with at least one trade |
+| `holding_period_days` | ≈ avg abs position / avg daily shares traded (~1/turnover; <1 = churns intraday) |
+| `avg_daily_dvolume` | Average gross dollar volume per day |
+| `avg_daily_turnover_ratio` | Avg daily dvolume / avg gross exposure |
+| `gross_exposure_avg` | Mean daily gross dollar exposure |
+| `net_exposure_avg` | Mean daily net dollar exposure |
+| `clip_binding_pct` | Fraction of (day, inst) pairs where position was clipped |
+| `n_days_any_clip` | Number of eval days where at least one instrument's position was clipped |
+
+### Instrument attribution
+| Key | Description |
+|---|---|
+| `inst_pl_total` | Array (50,): total per-instrument PL (mark-to-market − commission) |
+| `inst_pl_reconciliation_error` | Max daily \|Σ instrument PL − total PL\| (≈1e-12 — attribution is exact) |
+| `inst_sharpe` | Array (50,): annualised Sharpe per instrument |
+| `top3_instruments` / `bot3_instruments` | Indices ranked by total PL |
+| `top3_sharpe_instruments` / `bot3_sharpe_instruments` | Indices ranked by Sharpe |
+
+---
+
+## Visualisations
+
+`save_plots(result, metrics, "report.pdf")` produces an 11-panel PDF:
+
+1. Equity curve
+2. Daily PL bar chart
+3. Underwater / drawdown chart
+4. Daily PL distribution + VaR/CVaR markers
+5. Rolling 20-day volatility
+6. Per-instrument PL attribution
+7. Daily turnover ratio
+8. Rolling 20-day Sharpe ratio
+9. Per-instrument Sharpe ratio
+10. Walk-forward score box plot *(if `wf_folds` passed)*
+11. Bootstrap score distribution + CI *(if `boot_ci` passed)*
+
+---
+
+## Parity with official eval.py
+
+The engine replicates `eval.py` accounting exactly:
+
+- Integer position clipping: `±int($10,000 / price)` per instrument
+- Commission: `0.0010 * gross_dollar_volume`
+- Score: `mean(PL) - 0.1 * std(PL, ddof=0)`
+
+The framework's **default** eval window is the unseen rest after the research period
+(`--research-frac`, default `0.5` = first half), not eval.py's hardcoded `range(751, 1001)`.
+To reproduce eval.py byte-for-byte, pass `--eval-start 751 --eval-end 1001` (or
+`run_backtest(prices, strat, eval_start=751, eval_end=1001)`).
+
+Verified by `test_parity.py`, which runs the official eval loop alongside the engine:
+
+```bash
+python test_parity.py
+# All parity checks passed.  (diff = 0.00e+00 on score, mean, dvolume)
+```
+
+---
+
+## Methodology & bias — read before trusting a number
+
+This framework is designed to make overfitting and measurement bias **visible**, not to
+hide them. Key things every researcher must understand:
+
+### 1. There is one windowing knob: `RESEARCH_FRAC`
+The competition scores you on **genuinely new days** appended to the data you already have:
+on each future day `t` it calls `getMyPosition(prices[:, :t])` with the full expanding history
+(including earlier future days as they elapse), and only the PL on those new days counts.
+There is **no separate model-fitting step** the framework can sandbox — the strategy always
+sees full history up to `t` — so "out of sample" is purely a matter of *which days you looked
+at while designing*, not anything the engine can technically enforce. The framework therefore
+gives you exactly one knob:
+- **`--research-frac`** (default `0.5`) marks the research period `[0, research_frac * nt)` —
+  the days you're building/tuning against.
+- **If you don't pass explicit `--eval-start`/`--eval-end`**, the eval window defaults to "the
+  rest": `[research_frac * nt, nt)`.
+- **If you do pass explicit eval dates** — e.g. to score `[500, 750)` and deliberately leave
+  `[750, nt)` untouched for later — keeping that region unseen is **on you**. The engine
+  doesn't enforce a seal; it just runs whatever window you ask for.
+- If your model should only use the last *N* days, enforce that **inside** `getMyPosition`
+  (e.g. `prices[:, -N:]`) — the engine won't restrict history for you.
+- A single eval window is a sample of one — confirm stability with `walk_forward()` across
+  multiple windows (next point). And remember: an eval number is only honest if you did **not**
+  tune against those days first.
+- In `walk_forward()`, `train_size`/fold boundaries only decide **where test
+  windows start** — they do not restrict history. Two runs with different `train_size` over the
+  same window give identical scores.
+
+### 2. The p-value is optimistic; prefer the block bootstrap
+`t_stat` / `p_value` assume daily PL is i.i.d. Real PL is serially correlated
+(`autocorr_lag1`), which inflates significance. The **stationary block bootstrap**
+(`bootstrap_score_ci(method="stationary")`, the default) resamples blocks to preserve that
+autocorrelation and gives an honest CI. The `iid` method is provided only to show how much
+narrower — and how misleading — the naive interval is.
+
+### 3. Parameter tuning is the biggest bias source
+`parameter_sweep()` selects on an **in-sample** window and re-scores every combination on a
+held-out **out-of-sample** window. **Always trust the OOS column.** Indicators it returns:
+- `is_oos_corr` — correlation between in-sample and OOS scores. Near 0 or negative ⇒ the
+  ranking is noise and you are overfitting.
+- `expected_max_is_inflation` — roughly how much the best in-sample score is inflated by
+  chance from trying `n_trials` combinations (`σ_IS · √(2 ln n_trials)`). Subtract this
+  mentally from any in-sample result.
+- A loud `warning` whenever `n_trials > 1`.
+
+After a sweep, **re-validate the chosen parameters with `walk_forward()`** before believing
+them. A single backtest score on one window is never sufficient evidence.
+
+### 4. What is intentionally NOT modelled (matches eval.py)
+- **No slippage or market impact** — only the 10 bps commission. The real eval has none
+  either, so don't add fake costs, but don't assume your fills would be free in live markets.
+- **No borrow cost / financing** on shorts.
+- **No survivorship issues** — the 50 instruments are fixed for the whole sample.
+
+These are correct for *this competition* but mean the backtest is an optimistic upper bound
+on real-world performance.
+
+### 5. Drawdown % and "return" caveats
+- The equity curve starts at **$0** (no seed capital), so a percentage drawdown vs. the
+  running peak is meaningless. `max_drawdown_pct_capital` instead divides by average gross
+  exposure (capital actually deployed).
+- `pl_per_dollar_traded` (eval.py's "ret") is **PL per dollar traded**, not a return on
+  capital. Don't compare it to an annualised return.
+
+---
+
+## Competition assessment
+
+The scoring formula is:
+
+```
+Score = mean(daily PL) - 0.1 × StdDev(daily PL)
+```
+
+Strategies are evaluated on **unseen future data** for the same 50 instruments. Two tools
+target this directly: an explicit `--eval-start`/`--eval-end` window replicates the exact
+scenario (score only the days you designate as unseen, run forward live), and `--walk-forward`
+repeats that read across multiple time windows to show how stable it is. Use a single eval
+window for the headline "what would I have scored on the future" number and walk-forward to
+confirm it isn't a one-window fluke.
+
+Key design considerations:
+- **Commission drag** is 10 bps per trade — high turnover strategies need a strong edge to overcome it
+- **Position limits** cap at `$10,000 / price` shares per instrument — strategies should size positions to avoid constant clipping
+- **Runtime limit** is ~10 minutes — strategies with heavy per-day computation should be profiled
+
+## Workflow
+
+The development loop, start to finish:
+
+1. **Edit your strategy** in `main.py`.
+2. **Sanity-check the engine** (occasionally — not every run):
+   ```bash
+   python test_parity.py            # must say "All parity checks passed."
+   ```
+3. **Score it on the default eval window** — watch one number, `Score` (higher = better):
+   ```bash
+   python run_backtest.py
+   ```
+   This researches on the first `RESEARCH_FRAC` (default 50%) of days and scores the unseen
+   rest. Or pick an explicit sub-window and *deliberately* leave the remainder untouched:
+   ```bash
+   python run_backtest.py --eval-start 500 --eval-end 750
+   ```
+4. **Check it isn't a one-window fluke:**
+   ```bash
+   python run_backtest.py --walk-forward
+   ```
+   You want the per-fold `Score` mean positive and not swinging wildly between win and loss.
+
+Loop: edit → score on your eval window → if promising, `--walk-forward` → repeat.
+
+**The one rule:** change `main.py` because of a *market idea* ("these instruments mean-revert
+over ~2 weeks"), not because you watched the eval score and nudged `LOOKBACK` until it rose.
+Tuning against an eval window turns it back into an in-sample number — and the framework can't
+stop you from re-running a window you swore to leave alone; that discipline is yours. Leave
+`--full`, `--bootstrap`, parameter sweeps, and the full metrics suite for later — once a
+strategy actually scores positive and you want to stress-test it.
+
+### How the default eval window is derived
+With no explicit `--eval-start`/`--eval-end`, the CLI splits the data at
+`research_end = round(research_frac * nt)`: `[0, research_end)` is the **research window**
+(the days you may look at while building); `[research_end, nt)` is **scored, by default in
+full**. So with `research_frac=0.5` on a 1000-day dataset → research on days 0–499, score
+days 500–999.
+
+### Using `--max-days` and explicit eval dates to protect a true unseen segment
+`--max-days N` truncates `prices` to the first `N` days *before* any window resolution, so
+days `N`–`nt-1` are never visible to the engine or strategy. Combine it with explicit eval
+dates when you want to keep a final segment genuinely unseen for a last-look validation:
+
+```bash
+# All dev work stays within days 0-999
+python run_backtest.py --max-days 1000 --research-frac 0.5   # dev eval: days 500-999
+python run_backtest.py --max-days 1000 --walk-forward         # CV within days 0-999
+
+# Final check once (days 1000-end were never touched)
+python run_backtest.py --eval-start 1000
+```
