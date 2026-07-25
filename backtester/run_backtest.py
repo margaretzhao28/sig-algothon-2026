@@ -248,26 +248,30 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _launch_dashboard() -> None:
-    """Open the PyQt6 dashboard on the run we just saved (results/last_run.pkl)."""
+def _launch_dashboard(result=None, prices_file: str | None = None,
+                      strategy_name: str | None = None, pos_annot=None) -> None:
+    """Open the native PyQt score dashboard for the latest saved backtest."""
     import subprocess
+    import PyQt6
+
     here = os.path.dirname(os.path.abspath(__file__))
     app = os.path.join(here, "viz_qt.py")
-    # Prefer the project venv's python: PyQt6 lives there, and sys.executable may
-    # be a different interpreter (system/conda) that can run the backtest but not
-    # the dashboard.
-    venv_python = os.path.join(here, ".venv", "bin", "python")
-    python = venv_python if os.path.exists(venv_python) else sys.executable
     log_path = os.path.join(here, "results", "viz.log")
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    qt_platforms = os.path.join(
+        os.path.dirname(PyQt6.__file__), "Qt6", "plugins", "platforms"
+    )
+    child_env = os.environ.copy()
+    child_env["QT_QPA_PLATFORM_PLUGIN_PATH"] = qt_platforms
     with open(log_path, "w") as log:
         subprocess.Popen(
-            [python, app],
-            stdout=log, stderr=log,
+            [sys.executable, app, os.path.join(here, "results", "last_run.pkl")],
+            stdout=log,
+            stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=child_env,
         )
-    print("\nOpening dashboard window... (already open? hit its ⟳ Reload button; "
-          "--no-viz to skip; errors go to results/viz.log)")
+    print("\nOpening native score dashboard... (use its Reload button after a new run; "
+          "errors are saved to results/viz.log)")
 
 
 def main() -> None:
@@ -380,7 +384,7 @@ def main() -> None:
         except Exception as exc:                       # never block a run on the hover
             print(f"  (ridge-rank hover skipped: {exc})")
 
-    # Persist this run for the dashboard, then open/refresh it
+    # Persist this run, then open/refresh the interactive HTML visualizer.
     os.makedirs("results", exist_ok=True)
     with open(os.path.join("results", "last_run.pkl"), "wb") as f:
         pickle.dump({
@@ -394,7 +398,7 @@ def main() -> None:
         }, f)
 
     if not args.no_viz:
-        _launch_dashboard()
+        _launch_dashboard(result, args.prices, args.strategy, pos_annot)
 
     wf_folds = None
     boot_ci  = None
